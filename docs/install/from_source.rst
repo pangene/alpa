@@ -22,12 +22,12 @@ To install alpa from source, we need to build these forks.
 
 2. Install dependencies
 
-  - CUDA Toolkit: [cuda](https://developer.nvidia.com/cuda-toolkit), [cudnn](https://developer.nvidia.com/cudnn), and [nccl](https://developer.nvidia.com/nccl)
+  - CUDA Toolkit: `cuda <https://developer.nvidia.com/cuda-toolkit>`_, `cudnn <https://developer.nvidia.com/cudnn>`_, and `nccl <https://developer.nvidia.com/nccl>`_
   - Python packages:
 
   .. code:: bash
 
-    pip3 install cmake tqdm numpy scipy numba pybind11 "ray[default]" flax==0.4.1
+    pip3 install cmake tqdm numpy scipy numba pybind11 ray flax==0.4.1
     pip3 install cupy-cuda114  # use your own CUDA version. Here cuda-cuda114 means cuda 11.4.
 
   - ILP Solver:
@@ -37,7 +37,7 @@ To install alpa from source, we need to build these forks.
     sudo apt install coinor-cbc
     pip3 install pulp
 
-  If you do not have sudo permission, please try install via [binary](https://projects.coin-or.org/Cbc#DownloadandInstall) or [conda](https://anaconda.org/conda-forge/coincbc).
+  If you do not have sudo permission, please try install via `binary <https://projects.coin-or.org/Cbc#DownloadandInstall>`_ or `conda <https://anaconda.org/conda-forge/coincbc>`_.
 
 3. Build and install jaxlib
 
@@ -63,19 +63,13 @@ To install alpa from source, we need to build these forks.
     cd alpa
     pip3 install -e .
 
-6. Build XLA pipeline marker custom call
-
-  .. code:: bash
-  
-    cd alpa/alpa/pipeline_parallel/xla_custom_call_marker
-    bash build.sh
-
 .. note::
 
   All installations are in development mode, so you can modify python code and it will take effect immediately.
   To modify c++ code in tensorflow, you only need to run the command below from step 3 to recompile jaxlib::
 
     python3 build/build.py --enable_cuda --dev_install --tf_path=$TF_PATH
+
 
 Check Installation
 ------------------
