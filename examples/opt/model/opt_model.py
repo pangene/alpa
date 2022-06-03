@@ -525,8 +525,9 @@ def init_model_aval(config):
     return model, params
 
 
-def init_cache_aval(config, batch_size):
+def init_cache_aval(config):
     dtype = jnp.float32
+    batch_size = config.batch_size
     head_dim = config.decoder_embed_dim // config.decoder_attention_heads
 
     all_cache = []
@@ -544,7 +545,8 @@ def init_cache_aval(config, batch_size):
     return tuple(all_cache)
 
 
-def init_cache_np(config, batch_size):
+def init_cache_np(config):
+    batch_size = config.batch_size
     dtype = np.float32
     head_dim = config.decoder_embed_dim // config.decoder_attention_heads
 
@@ -672,9 +674,9 @@ def get_pipeshard_executable(config, support_output_attentions=False,
         return output
 
     executable = inference_step_with_cache.get_executable(params, {
-        "input_ids": jax.core.ShapedArray((1, 1), jnp.int32),
-        "position_ids": jax.core.ShapedArray((1, 1), jnp.int32),
-        "cache": init_cache_aval(config, 1),
+        "input_ids": jax.core.ShapedArray((config.batch_size, 1), jnp.int32),
+        "position_ids": jax.core.ShapedArray((config.batch_size, 1), jnp.int32),
+        "cache": init_cache_aval(config),
     })
 
     return executable, params
@@ -763,9 +765,9 @@ def load_params_dis_array(path, executable, params_aval, config, dummy=False):
         raise ValueError()
 
 
-def init_cache_dis_array(executable, config, batch_size, dummy=False):
+def init_cache_dis_array(executable, config, dummy=False):
     alpa.global_config.use_dummy_value_for_benchmarking = dummy
-    cache = init_cache_np(config, batch_size)
+    cache = init_cache_np(config)
     _, batch_info = executable.get_load_info()
     cache_info = batch_info["cache"]
     flat_args, in_tree = tree_flatten(cache)
