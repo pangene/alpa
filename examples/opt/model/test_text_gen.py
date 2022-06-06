@@ -102,11 +102,17 @@ class WrappedInferenceFunc(GenerationMixin):
         return ret
 
     def _reorder_cache(self, past, beam_idx):
-        # FIXME(yonghao): not work for alpa
+        # Current beam_idx is a torch tensor from beam scorer. To speedup,
+        # we need to have alpa's own beam scorer
+        # TODO(yonghao): only send index to the device mesh once for each mesh
+        to_device = lambda x: beam_idx.to(x.device) if hasattr(
+            x, "device") else beam_idx.to("cpu").numpy()
         return tuple(
-            tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past)
-            for layer_past in past
-        )
+            tuple(
+                past_state.index_select(0, to_device(past_state))
+                for past_state in layer_past)
+            for layer_past in past)
+
 
 def get_model(model_name, device, dummy, num_beams, cluster="aws",
               support_output_attentions=False,
@@ -206,7 +212,7 @@ def get_model(model_name, device, dummy, num_beams, cluster="aws",
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="facebook/opt-125m")
+    parser.add_argument("--model", type=str, default="alpa/opt-125m")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--cluster", type=str, default="aws")
     parser.add_argument("--dummy", action="store_true")

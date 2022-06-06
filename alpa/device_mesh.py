@@ -29,7 +29,7 @@ from typing import Any, List, Union, Sequence, Tuple, Optional, Callable
 import jax
 from jax import core, xla, device_put
 from jax._src.api import ShapeDtypeStruct
-from jax._src.lib import xla_bridge as xb, xla_extension as xe
+from jax._src.lib import xla_bridge as xb, xla_client as xc, xla_extension as xe
 from jax._src.tree_util import tree_leaves
 from jax.abstract_arrays import array_types
 from jax.core import ShapedArray
@@ -43,16 +43,18 @@ import cupy
 from cupy.cuda import nccl
 import ray
 import tensorstore as ts
-from tqdm import tqdm
 
 from alpa import mesh_profiling
 import alpa.collective as col
 from alpa.collective.collective_group import nccl_util
 from alpa.global_env import global_config
+from alpa.measure_record import StrategyConfig
 from alpa.monkey_patch import set_override_backend
-from alpa.shard_parallel.auto_sharding import LogicalDeviceMesh
+from alpa.shard_parallel.auto_sharding import (AutoShardingOption,
+                                               LogicalDeviceMesh,
+                                               run_spmd_partitioner_pass)
 from alpa.timer import timers
-from alpa.util import (benchmark_func, list_gpu_info,
+from alpa.util import (benchmark_func, get_index_select_computation, list_gpu_info,
                        jax_tensor_to_cupy, cupy_to_jax_tensor,
                        jax_tensor_set, xla_buffer_to_jax_tensor,
                        jax_tensor_to_xla_buffer, xla_buffer_to_cupy,
@@ -1552,6 +1554,36 @@ class DistributedArray:
         return self._value.__float__()
 
     # TODO(lmzheng): copy more functions from DeviceArray (jax/_src/device_array.py)
+    def index_select(self, dim, index):
+        """
+        TODO(yonghao):This is just a hack. We need to add jit or use precompiled
+        executable for this operation.
+
+        Compile and run index select operation.
+        """
+        # pylint: disable=import-outside-toplevel
+        from alpa.mesh_executable import NormalMeshDriverExecutable
+        if type(index) not in [ShapedArray, ShapeDtypeStruct]:
+            index = xla.canonicalize_dtype(index)
+        index_shape = xc.shape_from_pyval(index)
+        # TODO(yonghao): add cache for each executable
+        # with key = hash(("index_select", self.aval, dim, index_shape))
+        index_aval = ShapedArray(index.shape, index.dtype)
+        c = get_index_select_computation(self.sharding_spec, dim, self.aval,
+                                            index_shape)
+        hlo_module = run_spmd_partitioner_pass(c,
+                                                self.device_mesh.num_devices)
+
+        as_option = AutoShardingOption()
+        strategy_config = StrategyConfig(global_config.build_random_seed,
+                                            self.device_mesh.shape, 1 << 60,
+                                            as_option.all_reduce_threshold,
+                                            None, -1)
+        driver_executable = NormalMeshDriverExecutable(
+            self.device_mesh, hlo_module, strategy_config,
+            [self.aval, index_aval], [self.aval], [False, False])
+        ret = driver_executable.launch_on_driver(self, index)
+        return ret
 
     def __str__(self):
         return str(self._value)

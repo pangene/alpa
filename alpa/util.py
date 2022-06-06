@@ -35,7 +35,6 @@ import cupy as cp
 
 from alpa.global_env import global_config, is_worker
 
-
 ########################################
 ##### Alpa API Utilities
 ########################################
@@ -530,6 +529,23 @@ def compile_concatenate(backend, mesh_shape, sharding_spec, batch_size,
     compiled = backend.compile(c, compile_options)
     hlo_proto = compiled.hlo_modules()[0].as_serialized_hlo_module_proto()
     return hlo_proto
+
+
+def get_index_select_computation(sharding_spec, dim, aval, index_shape):
+    sharding = pxla.sharding_spec_sharding_proto(sharding_spec)
+    c = xc.XlaBuilder("index_select")
+    c.set_sharding(sharding)
+    operand = xc.ops.Parameter(
+        c, 0, xc.shape_from_pyval(np.ones(aval.shape, aval.dtype)))
+    c.clear_sharding()
+    index = xc.ops.Parameter(c, 1, index_shape)
+    index_selected = xc.ops.IndexSelect(operand, index, dim)
+    sharding2 = xc.OpSharding()
+    sharding2.type = sharding.type.TUPLE
+    sharding2.tuple_shardings = [sharding]
+    c.set_sharding(sharding2)
+    c = c.build(xc.ops.Tuple(c, [index_selected]))
+    return c
 
 
 def get_shard_shape(aval: ShapedArray, sharding_spec: pxla.ShardingSpec):
