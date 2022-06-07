@@ -807,6 +807,7 @@ class PhysicalDeviceMesh(ABC):
 
     num_hosts: int
     num_devices_per_host: int
+    operation_executables: dict
 
     def get_signature(self) -> str:
         """Return a signature string that contains the mesh shape and GPU model."""
@@ -984,6 +985,7 @@ class LocalPhysicalDeviceMesh(PhysicalDeviceMesh):
         self.num_hosts = 1
         self.num_devices_per_host = len(self.devices)
         self.device_strs = []
+        self.operation_executables = {}
 
     ##### Executable Related Functions #####
     def shard_args_to_bufs(self, shard_indices: Sequence[Sequence[Index]],
@@ -1056,6 +1058,7 @@ class LocalPhysicalDeviceMesh(PhysicalDeviceMesh):
 
     def shutdown(self, forced=False):
         self.sync_workers()
+        self.operation_executables.clear()
 
 
 def device_id_to_str(host_ip, device_id, device_type="gpu"):
@@ -1091,6 +1094,7 @@ class DistributedPhysicalDeviceMesh(PhysicalDeviceMesh):
         self.workers = None
         self.launched = False
         self.service_server = None
+        self.operation_executables = {}
 
         if devices is not None:
             if len(devices) != len(host_ids):
@@ -1406,6 +1410,7 @@ class DistributedPhysicalDeviceMesh(PhysicalDeviceMesh):
         if not self.launched:
             return
         if not forced:
+            self.operation_executables.clear()
             ray.get([w.shutdown.remote() for w in self.workers])
         for worker in self.workers:
             ray.kill(worker)
@@ -1414,6 +1419,7 @@ class DistributedPhysicalDeviceMesh(PhysicalDeviceMesh):
         self.service_server.shutdown()
         self.service_server = None
         self.launched = False
+        self.operation_executables.clear()  # clear with forced shutdown
 
 
 class DistributedArray:
@@ -1555,35 +1561,33 @@ class DistributedArray:
 
     # TODO(lmzheng): copy more functions from DeviceArray (jax/_src/device_array.py)
     def index_select(self, dim, index):
-        """
-        TODO(yonghao):This is just a hack. We need to add jit or use precompiled
-        executable for this operation.
-
-        Compile and run index select operation.
-        """
+        """Compile and run index select operation."""
         # pylint: disable=import-outside-toplevel
         from alpa.mesh_executable import NormalMeshDriverExecutable
         if type(index) not in [ShapedArray, ShapeDtypeStruct]:
             index = xla.canonicalize_dtype(index)
         index_shape = xc.shape_from_pyval(index)
-        # TODO(yonghao): add cache for each executable
-        # with key = hash(("index_select", self.aval, dim, index_shape))
-        index_aval = ShapedArray(index.shape, index.dtype)
-        c = get_index_select_computation(self.sharding_spec, dim, self.aval,
-                                            index_shape)
-        hlo_module = run_spmd_partitioner_pass(c,
-                                                self.device_mesh.num_devices)
+        key = hash(("index_select", self.aval, dim, index_shape))
+        if key in self.device_mesh.operation_executables:
+            executable = self.device_mesh.operation_executables[key]
+        else:
+            index_aval = ShapedArray(index.shape, index.dtype)
+            c = get_index_select_computation(self.sharding_spec, dim, self.aval,
+                                             index_shape)
+            hlo_module = run_spmd_partitioner_pass(c,
+                                                   self.device_mesh.num_devices)
 
-        as_option = AutoShardingOption()
-        strategy_config = StrategyConfig(global_config.build_random_seed,
-                                            self.device_mesh.shape, 1 << 60,
-                                            as_option.all_reduce_threshold,
-                                            None, -1)
-        driver_executable = NormalMeshDriverExecutable(
-            self.device_mesh, hlo_module, strategy_config,
-            [self.aval, index_aval], [self.aval], [False, False])
-        ret = driver_executable.launch_on_driver(self, index)
-        return ret
+            as_option = AutoShardingOption()
+            strategy_config = StrategyConfig(global_config.build_random_seed,
+                                             self.device_mesh.shape, 1 << 60,
+                                             as_option.all_reduce_threshold,
+                                             None, -1)
+            executable = NormalMeshDriverExecutable(self.device_mesh,
+                                                    hlo_module, strategy_config,
+                                                    [self.aval, index_aval],
+                                                    [self.aval], [False, False])
+            self.device_mesh.operation_executables[key] = executable
+        return executable.launch_on_driver(self, index)
 
     def __str__(self):
         return str(self._value)
