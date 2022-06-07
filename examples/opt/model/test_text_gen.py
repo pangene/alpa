@@ -7,6 +7,10 @@ import sys
 
 import alpa
 from alpa.util import write_tsv
+from jax import xla
+from jax import ShapeDtypeStruct, ShapedArray
+from jax.interpreters import pxla
+from jax.interpreters.pxla import NoSharding, Replicated, ShardingSpec
 import numpy as np
 import torch
 from transformers import GPT2Tokenizer, OPTForCausalLM, GPT2LMHeadModel
@@ -104,12 +108,29 @@ class WrappedInferenceFunc(GenerationMixin):
     def _reorder_cache(self, past, beam_idx):
         # Current beam_idx is a torch tensor from beam scorer. To speedup,
         # we need to have alpa's own beam scorer
-        # TODO(yonghao): only send index to the device mesh once for each mesh
-        to_device = lambda x: beam_idx.to(x.device) if hasattr(
-            x, "device") else beam_idx.to("cpu").numpy()
+        to_device = lambda x: beam_idx.to(x.device)
+        cache = {}
+        cpu_idx = beam_idx.to("cpu").numpy()
+        if type(cpu_idx) not in [ShapedArray, ShapeDtypeStruct]:
+            cpu_idx = xla.canonicalize_dtype(cpu_idx)
+
+        def to_mesh(mesh):
+            if mesh in cache:
+                return cache[mesh]
+            avals = [ShapedArray(cpu_idx.shape, cpu_idx.dtype)]
+            replicated_spec = ShardingSpec([NoSharding()] * len(cpu_idx.shape),
+                                           [Replicated(mesh.num_devices)])
+            specs = [replicated_spec]
+            indices = [pxla.spec_to_indices(cpu_idx.shape, replicated_spec)]
+            ary = mesh.shard_args_to_arrays(avals, indices, specs, [cpu_idx])[0]
+            cache[mesh] = ary
+            return ary
+
+        reshard = lambda x: to_device(x) if hasattr(x, "device") else to_mesh(
+            x.device_mesh)
         return tuple(
             tuple(
-                past_state.index_select(0, to_device(past_state))
+                past_state.index_select(0, reshard(past_state))
                 for past_state in layer_past)
             for layer_past in past)
 
