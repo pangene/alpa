@@ -1573,7 +1573,7 @@ class DistributedArray:
         else:
             index_aval = ShapedArray(index.shape, index.dtype)
             c = get_index_select_computation(self.sharding_spec, dim, self.aval,
-                                             index_shape)
+                                             index_shape).as_hlo_module()
             hlo_module = run_spmd_partitioner_pass(c,
                                                    self.device_mesh.num_devices)
 
