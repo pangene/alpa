@@ -7,8 +7,8 @@ class build_marker(build_ext):
 
     def run(self):
         cmd = "cd alpa/pipeline_parallel/xla_custom_call_marker; bash build.sh"
-        while True:
-            print(cmd)
+        # while True:
+        #     print(cmd)
         return os.system(cmd)
 
 
