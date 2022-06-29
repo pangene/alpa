@@ -11,6 +11,8 @@ from alpa.model.bert_model import BertConfig, FlaxBertForMaskedLMModule, TrainSt
 from alpa.model.gpt_model import FlaxGPTForLMModule
 from alpa.util import map_to_shape, count_communication_primitives, print_used_time, GB
 
+import os
+
 as_option = global_config.default_autosharding_option
 
 
@@ -163,18 +165,18 @@ def benchmark_2d_one_case_gpt_bert(physical_mesh, model_type, benchmark_case):
 
     # Compile executable
     train_step = get_train_step(grad_func, num_layers, dtype)
-    executable = train_step.get_executable(state, batch, rngkey)
+    executable, args_flat = train_step.get_executable(state, batch, rngkey)
     print_used_time("Compile (driver)")
 
-    return executable
+    return executable, args_flat
 
 
 
 if __name__ == "__main__":
     model_type = "gpt"
 
-    num_nodes = 2
-    num_devices_per_node = 8
+    num_nodes = 1
+    num_devices_per_node = 2
     _ = None
 
     # Define a model with 1.3B parameters
@@ -195,10 +197,20 @@ if __name__ == "__main__":
     physical_mesh = LocalPhysicalDeviceMesh(devices=[None] * num_devices)
 
     # Compile a mesh executable
-    executable = benchmark_2d_one_case_gpt_bert(physical_mesh, "gpt", benchmark_case)
+    executable, args_flat = benchmark_2d_one_case_gpt_bert(physical_mesh, "gpt", benchmark_case)
+
+    print("Write args to {cwd}/inputs/")
+    cwd = os.getcwd()
+    dir_name = "inputs"
+    ins_folder = os.path.join(cwd, dir_name)
+    if not os.path.exists(ins_folder):
+        os.makedirs(ins_folder)
+    for i, arg in enumerate(args_flat):
+        arg_path = os.path.join(ins_folder, str(i))
+        jnp.save(arg_path, arg)
 
     # Write hlo ir to a file
-    print(type(executable.hlo_module))
+    # print(type(executable))
 
     print("Write hlo module to files...")
     with open("executable_hlo.txt", "w") as fout:

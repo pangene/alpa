@@ -46,3 +46,9 @@ docs/tutorials
 
 # Example temp files
 examples/imagenet/imagenet
+
+*.neff
+*.proto
+*.txt
+*.csv
+hlo
