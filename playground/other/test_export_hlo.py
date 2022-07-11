@@ -16,6 +16,17 @@ import os
 as_option = global_config.default_autosharding_option
 
 
+def compute_gpt_parameter_count(num_layers, hidden_size, vocab_size):
+    return num_layers * (
+        # self-attention
+        hidden_size * (3 * hidden_size + 1) + hidden_size * (hidden_size + 1) +
+        # mlp
+        hidden_size * (4 * hidden_size + 1) + hidden_size * 4 *
+        (hidden_size + 1) +
+        # layer norm
+        hidden_size * 4) + vocab_size * (hidden_size + 1)
+
+
 def create_train_state(rngkey, model, dtype, batch):
     params = model.init_dummy(rngkey, batch["input_ids"], batch["attention_mask"],
                               batch["token_type_ids"], batch["position_ids"])
@@ -165,6 +176,7 @@ def benchmark_2d_one_case_gpt_bert(physical_mesh, model_type, benchmark_case):
 
     # Compile executable
     train_step = get_train_step(grad_func, num_layers, dtype)
+    train_step(state, batch, rngkey)
     executable, args_flat = train_step.get_executable(state, batch, rngkey)
     print_used_time("Compile (driver)")
 
@@ -175,8 +187,8 @@ def benchmark_2d_one_case_gpt_bert(physical_mesh, model_type, benchmark_case):
 if __name__ == "__main__":
     model_type = "gpt"
 
-    num_nodes = 1
-    num_devices_per_node = 2
+    num_nodes = 1  # machines
+    num_devices_per_node = 2  # cores
     _ = None
 
     # Define a model with 1.3B parameters
@@ -188,9 +200,18 @@ if __name__ == "__main__":
     # RS = prefer_reduce_scatter
     benchmark_case = (
         #B, S,     H      L,  #head, V,     LD0,       LD1,
-        8,  1024,  2048,  2,  32,    51200, num_nodes, num_devices_per_node, 
+        16,  512,  512,  2,  32,    12800, num_nodes, num_devices_per_node, 
+        # hidden size and vocab size should be multiples of num_devices
+        # 8,  1024,  2048,  2,  32,    51200, num_nodes, num_devices_per_node, 
         #_,_,  PP,  NB, FM,   Remat, RS,    _  _
         _, _,  1,   1,  True, False, False, _, _)
+
+    num_layers, hidden_size, vocab_size = (benchmark_case[3], benchmark_case[2],
+                                           benchmark_case[5])
+    param_count = compute_gpt_parameter_count(num_layers, hidden_size,
+                                              vocab_size)
+    # print(f"Param count: {param_count/1e9:.2f} B")
+    print(f"Param count: {param_count}")
 
     # Device a fake physical mesh
     num_devices = num_nodes * num_devices_per_node
@@ -199,7 +220,11 @@ if __name__ == "__main__":
     # Compile a mesh executable
     executable, args_flat = benchmark_2d_one_case_gpt_bert(physical_mesh, "gpt", benchmark_case)
 
-    print("Write args to {cwd}/inputs/")
+    # Checking stuff, ignore these
+    # executable.preshard_dynamic_args(*args_flat)
+    # print("HERE", executable.avals)
+
+    print("Write args to inputs/")
     cwd = os.getcwd()
     dir_name = "inputs"
     ins_folder = os.path.join(cwd, dir_name)
@@ -207,7 +232,12 @@ if __name__ == "__main__":
         os.makedirs(ins_folder)
     for i, arg in enumerate(args_flat):
         arg_path = os.path.join(ins_folder, str(i))
+        print(i, ":", type(arg), arg)
         jnp.save(arg_path, arg)
+    for i in range(32):
+        partition_id = jnp.array([i], dtype=np.dtype("u4"))
+        arg_path = os.path.join(ins_folder, "partition_id_" + str(i))
+        jnp.save(arg_path, partition_id)
 
     # Write hlo ir to a file
     # print(type(executable))
