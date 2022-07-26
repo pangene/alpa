@@ -52,3 +52,4 @@ examples/imagenet/imagenet
 *.txt
 *.csv
 hlo
+temp/

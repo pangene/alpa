@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from get_wikitext import load_wikitext2, prepare_batch
 
 import alpa
 from alpa import parallelize, global_config, set_parallelize_options, LocalPhysicalDeviceMesh
@@ -27,18 +28,18 @@ def compute_gpt_parameter_count(num_layers, hidden_size, vocab_size):
         hidden_size * 4) + vocab_size * (hidden_size + 1)
 
 
-def create_train_state(rngkey, model, dtype, batch):
-    params = model.init_dummy(rngkey, batch["input_ids"], batch["attention_mask"],
+def create_train_state(rngkey, model, batch, dtype):
+    params = model.init(rngkey, batch["input_ids"], batch["attention_mask"],
                               batch["token_type_ids"], batch["position_ids"])
 
     def weight_decay_mask(pytree):
         # do not use weight decay on layer norm and bias.
         return jax.tree_map(lambda x: x.ndim > 1, pytree)
 
-    tx = optax.chain(
+    tx = optax.adamw(learning_rate=2e-5, mask=weight_decay_mask, eps_root=1e-9)
+        # optax.sgd(learning_rate=4e-4)
         #optax.clip_by_global_norm(1.0),  # TODO(lmzheng): fix reduce-scatter for this
-        optax.adamw(learning_rate=1e-2, mask=weight_decay_mask)
-    )
+        # optax.adamw(learning_rate=4e-4, mask=weight_decay_mask)
 
     mixed_precision = (dtype == jnp.float16)
 
@@ -96,7 +97,8 @@ def get_train_step(grad_func, num_layers, dtype):
         grads = grad_func(loss_func)(state.params)
         new_state = state.apply_gradients(grads=grads)
         # TODO(lmzheng): add dynamic scaling for mixed-precision training
-        return new_state
+        # return new_state
+        return loss_func(state.params), new_state
 
     return train_step
 
@@ -135,13 +137,19 @@ def benchmark_2d_one_case_gpt_bert(physical_mesh, model_type, benchmark_case):
     print_used_time("Setup device mesh")
 
     # Prepare input batch
-    batch = {
-        "input_ids": jnp.ones((batch_size, seq_len), dtype=jnp.int32),
-        "attention_mask": jnp.ones((batch_size, seq_len), dtype=jnp.int32),
-        "token_type_ids": jnp.ones((batch_size, seq_len), dtype=jnp.int32),
-        "position_ids": jnp.ones((batch_size, seq_len), dtype=jnp.int32),
-        "labels": jnp.ones((batch_size, seq_len), dtype=jnp.int32),
-    }
+    # batch = {
+    #     "input_ids": jnp.ones((batch_size, seq_len), dtype=jnp.int32),
+    #     "attention_mask": jnp.ones((batch_size, seq_len), dtype=jnp.int32),
+    #     "token_type_ids": jnp.ones((batch_size, seq_len), dtype=jnp.int32),
+    #     "position_ids": jnp.ones((batch_size, seq_len), dtype=jnp.int32),
+    #     "labels": jnp.ones((batch_size, seq_len), dtype=jnp.int32),
+    # }
+    # print(type(batch))
+    # print("----HERE----")
+    ds = load_wikitext2(batch_size, seq_len)
+    batch = next(ds)
+    prepare_batch(batch)
+
     print_used_time("Prepare input")
 
     # Init train state
@@ -171,12 +179,11 @@ def benchmark_2d_one_case_gpt_bert(physical_mesh, model_type, benchmark_case):
         raise ValueError(f"Invalid model {model_type}")
 
     rngkey = jax.random.PRNGKey(0)
-    state = create_train_state_aval(rngkey, model, batch, dtype)
+    state = create_train_state(rngkey, model, batch, dtype)
     print_used_time("Create train state")
 
     # Compile executable
     train_step = get_train_step(grad_func, num_layers, dtype)
-    train_step(state, batch, rngkey)
     executable, args_flat = train_step.get_executable(state, batch, rngkey)
     print_used_time("Compile (driver)")
 
@@ -218,29 +225,39 @@ if __name__ == "__main__":
     physical_mesh = LocalPhysicalDeviceMesh(devices=[None] * num_devices)
 
     # Compile a mesh executable
-    executable, args_flat = benchmark_2d_one_case_gpt_bert(physical_mesh, "gpt", benchmark_case)
+    executable, args_flat = benchmark_2d_one_case_gpt_bert(physical_mesh, model_type, benchmark_case)
 
     # Checking stuff, ignore these
-    # executable.preshard_dynamic_args(*args_flat)
-    # print("HERE", executable.avals)
+    # # print(sharded_args[4].device_buffers)
 
     print("Write args to inputs/")
+    sharded_args = executable.preshard_dynamic_args(*args_flat)
     cwd = os.getcwd()
     dir_name = "inputs"
+    partition_dir_name="partition_id"
     ins_folder = os.path.join(cwd, dir_name)
+    partition_id_folder = os.path.join(ins_folder, partition_dir_name)
     if not os.path.exists(ins_folder):
         os.makedirs(ins_folder)
-    for i, arg in enumerate(args_flat):
-        arg_path = os.path.join(ins_folder, str(i))
-        print(i, ":", type(arg), arg)
-        jnp.save(arg_path, arg)
+    if not os.path.exists(partition_id_folder):
+        os.makedirs(partition_id_folder)
+    for i, arg in enumerate(sharded_args):
+        # print(i, ":", type(arg), arg.shape)
+        for j, device in enumerate(arg.device_buffers):
+            device_folder = os.path.join(ins_folder, "dev_" + str(j))
+            if not os.path.exists(device_folder):
+                os.makedirs(device_folder)
+            arg_path = os.path.join(device_folder, str(i))
+            # print(i, ":", f"dev_{j}", ":", type(arg.device_buffers[j]), arg.device_buffers[j].shape)
+            # print(arg.device_buffers[j])
+            jnp.save(arg_path, arg.device_buffers[j])
     for i in range(32):
-        partition_id = jnp.array([i], dtype=np.dtype("u4"))
-        arg_path = os.path.join(ins_folder, "partition_id_" + str(i))
+        partition_id = jnp.array([i], dtype=np.uint32)
+        arg_path = os.path.join(partition_id_folder, "partition_id_" + str(i))
         jnp.save(arg_path, partition_id)
 
-    # Write hlo ir to a file
-    # print(type(executable))
+    # # Write hlo ir to a file
+    # # print(type(executable))
 
     print("Write hlo module to files...")
     with open("executable_hlo.txt", "w") as fout:
@@ -249,6 +266,8 @@ if __name__ == "__main__":
     with open("executable_hlo.proto", "wb") as fout:
         fout.write(executable.hlo_module.as_serialized_hlo_module_proto())
 
-    # Get the sharding specs of the inputs and outputs of the hlo module
-    # print(executable.input_sharding_specs)
-    # print(executable.output_sharding_specs)
+    # # Get the sharding specs of the inputs and outputs of the hlo module
+    # # print(executable.input_sharding_specs)
+    # # print(executable.output_sharding_specs)
+
+    print("DONE")

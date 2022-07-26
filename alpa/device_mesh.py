@@ -683,6 +683,9 @@ class LocalPhysicalDeviceMesh(PhysicalDeviceMesh):
                            donated_invars: Sequence[bool], args):
         ret = []
         for arg, donated, indices in zip(args, donated_invars, shard_indices):
+            # if isinstance(arg, ShapeDtypeStruct):
+            #     print(jnp.can_cast(ShapeDtypeStruct, np.ndarray))
+            #     arg = jnp.array(arg)
             ret.append(pxla._shard_arg(arg, self.devices, indices))
             if isinstance(arg, xe.DeviceArray) and donated:
                 arg.delete()
