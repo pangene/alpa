@@ -1,5 +1,6 @@
 """Benchmark one case of intra-op only parallelism."""
 from flax import linen as nn
+# from transformers import GPT2Model, GPT2Config
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -15,6 +16,11 @@ from alpa.util import map_to_shape, count_communication_primitives, print_used_t
 import os
 
 as_option = global_config.default_autosharding_option
+
+USE_WIKITEXT2 = True
+GENERATE_REAL_TRAIN_STATE = True
+
+INPUT_DIR_NAME = "inputs_test/"
 
 
 def compute_gpt_parameter_count(num_layers, hidden_size, vocab_size):
@@ -36,7 +42,7 @@ def create_train_state(rngkey, model, batch, dtype):
         # do not use weight decay on layer norm and bias.
         return jax.tree_map(lambda x: x.ndim > 1, pytree)
 
-    tx = optax.adamw(learning_rate=2e-5, mask=weight_decay_mask, eps_root=1e-9)
+    tx = optax.adamw(learning_rate=4e-4, mask=weight_decay_mask, eps_root=1e-9)
         # optax.sgd(learning_rate=4e-4)
         #optax.clip_by_global_norm(1.0),  # TODO(lmzheng): fix reduce-scatter for this
         # optax.adamw(learning_rate=4e-4, mask=weight_decay_mask)
@@ -61,10 +67,8 @@ def create_train_state_aval(rngkey, model, batch, dtype):
         # do not use weight decay on layer norm and bias.
         return jax.tree_map(lambda x: x.ndim > 1, pytree)
 
-    tx = optax.chain(
-        #optax.clip_by_global_norm(1.0),  # TODO(lmzheng): fix reduce-scatter for this
-        optax.adamw(learning_rate=1e-2, mask=weight_decay_mask)
-    )
+    tx = optax.adamw(learning_rate=2e-5, mask=weight_decay_mask, eps_root=1e-9)
+
     mixed_precision = (dtype == jnp.float16)
     state = TrainState.create_aval(
         apply_fn=model.apply,
@@ -137,18 +141,18 @@ def benchmark_2d_one_case_gpt_bert(physical_mesh, model_type, benchmark_case):
     print_used_time("Setup device mesh")
 
     # Prepare input batch
-    # batch = {
-    #     "input_ids": jnp.ones((batch_size, seq_len), dtype=jnp.int32),
-    #     "attention_mask": jnp.ones((batch_size, seq_len), dtype=jnp.int32),
-    #     "token_type_ids": jnp.ones((batch_size, seq_len), dtype=jnp.int32),
-    #     "position_ids": jnp.ones((batch_size, seq_len), dtype=jnp.int32),
-    #     "labels": jnp.ones((batch_size, seq_len), dtype=jnp.int32),
-    # }
-    # print(type(batch))
-    # print("----HERE----")
-    ds = load_wikitext2(batch_size, seq_len)
-    batch = next(ds)
-    prepare_batch(batch)
+    if not USE_WIKITEXT2:
+        batch = {
+            "input_ids": jnp.ones((batch_size, seq_len), dtype=jnp.int32),
+            "attention_mask": jnp.ones((batch_size, seq_len), dtype=jnp.int32),
+            "token_type_ids": jnp.ones((batch_size, seq_len), dtype=jnp.int32),
+            "position_ids": jnp.ones((batch_size, seq_len), dtype=jnp.int32),
+            "labels": jnp.ones((batch_size, seq_len), dtype=jnp.int32),
+        }
+    else:
+        ds = load_wikitext2(batch_size, seq_len)
+        batch = next(ds)
+        prepare_batch(batch)
 
     print_used_time("Prepare input")
 
@@ -178,8 +182,10 @@ def benchmark_2d_one_case_gpt_bert(physical_mesh, model_type, benchmark_case):
     else:
         raise ValueError(f"Invalid model {model_type}")
 
+    create_func = create_train_state if GENERATE_REAL_TRAIN_STATE else create_train_state_aval
+
     rngkey = jax.random.PRNGKey(0)
-    state = create_train_state(rngkey, model, batch, dtype)
+    state = create_func(rngkey, model, batch, dtype)
     print_used_time("Create train state")
 
     # Compile executable
@@ -195,7 +201,7 @@ if __name__ == "__main__":
     model_type = "gpt"
 
     num_nodes = 1  # machines
-    num_devices_per_node = 2  # cores
+    num_devices_per_node = 32  # cores
     _ = None
 
     # Define a model with 1.3B parameters
@@ -206,10 +212,16 @@ if __name__ == "__main__":
     # NB = num_micro_batches, FM = force_batch_dim_mapping, Remat = use_rematerialization
     # RS = prefer_reduce_scatter
     benchmark_case = (
-        #B, S,     H      L,  #head, V,     LD0,       LD1,
-        16,  512,  512,  2,  32,    12800, num_nodes, num_devices_per_node, 
+        #B, S,     H      L,  #head, V,     LD0,       LD1,  
         # hidden size and vocab size should be multiples of num_devices
-        # 8,  1024,  2048,  2,  32,    51200, num_nodes, num_devices_per_node, 
+        # 12M testing
+        # 16,  512,  512,  2,  32,    12800, num_nodes, num_devices_per_node, 
+        # 300M
+        # 1,  128,  1024,  24,  32,    25600, num_nodes, num_devices_per_node,
+        # test
+        # 1,  128,  1600,  24,  32,    25600, num_nodes, num_devices_per_node,
+        # 1.3B
+        1,  128,  2048,  24,  32,    32032, num_nodes, num_devices_per_node, 
         #_,_,  PP,  NB, FM,   Remat, RS,    _  _
         _, _,  1,   1,  True, False, False, _, _)
 
@@ -217,8 +229,8 @@ if __name__ == "__main__":
                                            benchmark_case[5])
     param_count = compute_gpt_parameter_count(num_layers, hidden_size,
                                               vocab_size)
-    # print(f"Param count: {param_count/1e9:.2f} B")
-    print(f"Param count: {param_count}")
+    print(f"Param count: {param_count/1e9:.2f} B")
+    # print(f"Param count: {param_count}")
 
     # Device a fake physical mesh
     num_devices = num_nodes * num_devices_per_node
@@ -227,15 +239,15 @@ if __name__ == "__main__":
     # Compile a mesh executable
     executable, args_flat = benchmark_2d_one_case_gpt_bert(physical_mesh, model_type, benchmark_case)
 
-    # Checking stuff, ignore these
-    # # print(sharded_args[4].device_buffers)
-
+    # Write args
     print("Write args to inputs/")
     sharded_args = executable.preshard_dynamic_args(*args_flat)
+    num_inputs = len(sharded_args)
+    print("Number of inputs:", num_inputs)
     cwd = os.getcwd()
-    dir_name = "inputs"
+    main_dir = os.path.join(INPUT_DIR_NAME, "iter_" + str(0))
     partition_dir_name="partition_id"
-    ins_folder = os.path.join(cwd, dir_name)
+    ins_folder = os.path.join(cwd, main_dir)
     partition_id_folder = os.path.join(ins_folder, partition_dir_name)
     if not os.path.exists(ins_folder):
         os.makedirs(ins_folder)
@@ -266,8 +278,8 @@ if __name__ == "__main__":
     with open("executable_hlo.proto", "wb") as fout:
         fout.write(executable.hlo_module.as_serialized_hlo_module_proto())
 
-    # # Get the sharding specs of the inputs and outputs of the hlo module
-    # # print(executable.input_sharding_specs)
-    # # print(executable.output_sharding_specs)
+    # Get the sharding specs of the inputs and outputs of the hlo module
+    # print(executable.input_sharding_specs)
+    # print(executable.output_sharding_specs)
 
     print("DONE")

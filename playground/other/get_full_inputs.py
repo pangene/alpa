@@ -6,7 +6,7 @@ import numpy as np
 import optax
 
 from get_wikitext import load_wikitext2, prepare_batch
-from test_export_hlo import create_train_state
+from test_export_hlo import create_train_state, get_train_step, compute_gpt_parameter_count
 
 import alpa
 from alpa import parallelize, global_config, set_parallelize_options, LocalPhysicalDeviceMesh
@@ -20,46 +20,9 @@ as_option = global_config.default_autosharding_option
 
 ds = None
 
-NUM_BATCHES = 220
-NUM_INPUTS = 124
+DIR_NAME = "inputs_test/"
 
-
-def compute_gpt_parameter_count(num_layers, hidden_size, vocab_size):
-    return num_layers * (
-        # self-attention
-        hidden_size * (3 * hidden_size + 1) + hidden_size * (hidden_size + 1) +
-        # mlp
-        hidden_size * (4 * hidden_size + 1) + hidden_size * 4 *
-        (hidden_size + 1) +
-        # layer norm
-        hidden_size * 4) + vocab_size * (hidden_size + 1)
-
-def get_train_step(grad_func, num_layers, dtype):
-
-    @parallelize
-    def train_step(state, batch, rng_key):
-        def loss_func(params):
-            rngs = {"dropout": rng_key}
-            logits = state.apply_fn(params,
-                                    batch["input_ids"],
-                                    batch["attention_mask"],
-                                    batch["token_type_ids"],
-                                    batch["position_ids"],
-                                    deterministic=True,
-                                    rngs=rngs)[0]
-            label_mask = jnp.where(batch["labels"] > 0, 1.0, 0.0)
-            labels = jax.nn.one_hot(batch["labels"], logits.shape[-1])
-            loss = -jnp.sum(labels * jax.nn.log_softmax(logits, axis=-1), axis=-1)
-            loss = (label_mask * loss).sum() / label_mask.sum()
-            return loss
-
-        grads = grad_func(loss_func)(state.params)
-        new_state = state.apply_gradients(grads=grads)
-        # TODO(lmzheng): add dynamic scaling for mixed-precision training
-        # return new_state
-        return loss_func(state.params), new_state
-
-    return train_step
+BATCH_INPUTS_SIZE = 5
 
 
 def benchmark_2d_one_case_gpt_bert(physical_mesh, model_type, benchmark_case):
@@ -96,15 +59,6 @@ def benchmark_2d_one_case_gpt_bert(physical_mesh, model_type, benchmark_case):
     print_used_time("Setup device mesh")
 
     # Prepare input batch
-    # batch = {
-    #     "input_ids": jnp.ones((batch_size, seq_len), dtype=jnp.int32),
-    #     "attention_mask": jnp.ones((batch_size, seq_len), dtype=jnp.int32),
-    #     "token_type_ids": jnp.ones((batch_size, seq_len), dtype=jnp.int32),
-    #     "position_ids": jnp.ones((batch_size, seq_len), dtype=jnp.int32),
-    #     "labels": jnp.ones((batch_size, seq_len), dtype=jnp.int32),
-    # }
-    # print(type(batch))
-    # print("----HERE----")
     global ds
     if ds == None:
         ds = load_wikitext2(batch_size, seq_len)
@@ -166,10 +120,14 @@ def main(iter=0):
     # NB = num_micro_batches, FM = force_batch_dim_mapping, Remat = use_rematerialization
     # RS = prefer_reduce_scatter
     benchmark_case = (
-        #B, S,     H      L,  #head, V,     LD0,       LD1,
-        16,  512,  512,  2,  32,    12800, num_nodes, num_devices_per_node, 
+        #B, S,     H      L,  #head, V,     LD0,       LD1,  
         # hidden size and vocab size should be multiples of num_devices
-        # 8,  1024,  2048,  2,  32,    51200, num_nodes, num_devices_per_node, 
+        # 12M testing
+        # 16,  512,  512,  2,  32,    12800, num_nodes, num_devices_per_node, 
+        # 300M
+        1,  128,  1024,  24,  32,    25600,   num_nodes,  num_devices_per_node,
+        # 1.3B
+        # 1,  128,  2048,  24,  16,    32032, num_nodes, num_devices_per_node, 
         #_,_,  PP,  NB, FM,   Remat, RS,    _  _
         _, _,  1,   1,  True, False, False, _, _)
 
@@ -190,14 +148,15 @@ def main(iter=0):
     # Checking stuff, ignore these
     # # print(sharded_args[4].device_buffers)
 
-    print("Write args to inputs/")
+    print(f"Write args to {DIR_NAME}")
     sharded_args = executable.preshard_dynamic_args(*args_flat)
+    num_inputs = len(sharded_args)
     if iter > 0:
-        sharded_args = sharded_args[NUM_INPUTS - 5:]
+        sharded_args = sharded_args[num_inputs - BATCH_INPUTS_SIZE:]
     cwd = os.getcwd()
-    dir_name = "inputs_adam/iter_" + str(iter)
+    main_dir = os.path.join(DIR_NAME, "iter_" + str(iter))
     partition_dir_name="partition_id"
-    ins_folder = os.path.join(cwd, dir_name)
+    ins_folder = os.path.join(cwd, main_dir)
     partition_id_folder = os.path.join(ins_folder, partition_dir_name)
     if not os.path.exists(ins_folder):
         os.makedirs(ins_folder)
@@ -205,7 +164,7 @@ def main(iter=0):
         os.makedirs(partition_id_folder)
     for i, arg in enumerate(sharded_args):
         if iter > 0:
-            i += NUM_INPUTS - 5
+            i += num_inputs - BATCH_INPUTS_SIZE
         # print(i, ":", type(arg), arg.shape)
         for j, device in enumerate(arg.device_buffers):
             device_folder = os.path.join(ins_folder, "dev_" + str(j))
@@ -223,6 +182,11 @@ def main(iter=0):
     print("DONE")
 
 if __name__ == "__main__":
-    for i in range(NUM_BATCHES):
+    i = 0
+    while True:
         print("Generating iter:", i)
-        main(i)
+        try:
+            main(i)
+        except StopIteration:
+            break
+        i += 1

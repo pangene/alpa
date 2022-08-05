@@ -1,5 +1,6 @@
 """Train gpt2 with alpa on gpu."""
 
+from math import isnan
 from flax import linen as nn
 import jax
 import jax.numpy as jnp
@@ -7,7 +8,7 @@ import numpy as np
 import optax
 # import matplotlib.pyplot as plt
 from get_wikitext import load_wikitext2, prepare_batch
-from test_export_hlo import create_train_state
+from test_export_hlo import create_train_state, get_train_step, compute_gpt_parameter_count
 
 import alpa
 from alpa import parallelize, global_config, set_parallelize_options, LocalPhysicalDeviceMesh
@@ -18,48 +19,9 @@ from alpa.util import map_to_shape, count_communication_primitives, print_used_t
 import pickle
 import time
 
-NUM_EPOCHS = 10
+NUM_EPOCHS = 3
 
 as_option = global_config.default_autosharding_option
-
-
-def compute_gpt_parameter_count(num_layers, hidden_size, vocab_size):
-    return num_layers * (
-        # self-attention
-        hidden_size * (3 * hidden_size + 1) + hidden_size * (hidden_size + 1) +
-        # mlp
-        hidden_size * (4 * hidden_size + 1) + hidden_size * 4 *
-        (hidden_size + 1) +
-        # layer norm
-        hidden_size * 4) + vocab_size * (hidden_size + 1)
- 
-
-def get_train_step(grad_func, num_layers, dtype):
-
-    @parallelize
-    def train_step(state, batch, rng_key):
-        def loss_func(params):
-            rngs = {"dropout": rng_key}
-            logits = state.apply_fn(params,
-                                    batch["input_ids"],
-                                    batch["attention_mask"],
-                                    batch["token_type_ids"],
-                                    batch["position_ids"],
-                                    deterministic=True,
-                                    rngs=rngs)[0]
-            label_mask = jnp.where(batch["labels"] > 0, 1.0, 0.0)
-            labels = jax.nn.one_hot(batch["labels"], logits.shape[-1])
-            loss = -jnp.sum(labels * jax.nn.log_softmax(logits, axis=-1), axis=-1)
-            loss = (label_mask * loss).sum() / label_mask.sum()
-            return loss
-
-        grads = grad_func(loss_func)(state.params)
-        new_state = state.apply_gradients(grads=grads)
-        # TODO(lmzheng): add dynamic scaling for mixed-precision training
-        # return new_state
-        return loss_func(state.params), new_state
-
-    return train_step
 
 
 def train_loop_gpt_bert(model_type, benchmark_case):
@@ -67,7 +29,7 @@ def train_loop_gpt_bert(model_type, benchmark_case):
 
     # Model configs
     (batch_size, seq_len, hidden_size, num_layers, num_heads, vocab_size,
-     p_dim0, p_dim1, pipeline_mp_size, num_micro_batches, force_batch_dim_mapping,
+     l_dim0, l_dim1, p_dim0, p_dim1, pipeline_mp_size, num_micro_batches, force_batch_dim_mapping,
      use_remat, prefer_reduce_scatter, other, overwrite_global_config_dict) = benchmark_case
  
     dtype = jnp.float16
@@ -145,6 +107,8 @@ def train_loop_gpt_bert(model_type, benchmark_case):
             loss, state = result[0], result[1]
             if i % 1 == 0:
                 print(i, "- LOSS:", loss)
+            if np.isnan(loss):
+                raise Exception(f"NaN found in epoch {epoch} iter {i}")
             losses.append(float(loss))
             i += 1
 
@@ -160,8 +124,6 @@ def train_loop_gpt_bert(model_type, benchmark_case):
 if __name__ == "__main__":
     model_type = "gpt"
 
-    num_nodes = 1  # machines
-    num_devices_per_node = 1  # cores
     _ = None
 
     # Define a model with 1.3B parameters
@@ -172,10 +134,14 @@ if __name__ == "__main__":
     # NB = num_micro_batches, FM = force_batch_dim_mapping, Remat = use_rematerialization
     # RS = prefer_reduce_scatter
     benchmark_case = (
-        #B, S,     H      L,  #head, V,     LD0,       LD1,
-        16,  512,  512,  2,  32,    12800,
+        #B, S,     H      L,  #head, V,     LD0,       LD1,  
         # hidden size and vocab size should be multiples of num_devices
-        # 8,  1024,  2048,  2,  32,    51200, num_nodes, num_devices_per_node, 
+        # 12M testing
+        # 16,  512,  512,  2,  32,    12800, num_nodes, num_devices_per_node, 
+        # 300M
+        8,  128,  1024,  24,  32,    25600,   _,         _,
+        # 1.3B
+        # 1,  128,  2048,  24,  16,    32032, num_nodes, num_devices_per_node, 
         #_,_,  PP,  NB, FM,   Remat, RS,    _  _
         _, _,  1,   1,  True, False, False, _, _)
 
