@@ -125,6 +125,8 @@ if __name__ == "__main__":
     model_type = "gpt"
 
     _ = None
+    num_nodes = _  # machines
+    num_devices_per_node = _  # cores
 
     # Define a model with 1.3B parameters
 
@@ -139,9 +141,9 @@ if __name__ == "__main__":
         # 12M testing
         # 16,  512,  512,  2,  32,    12800, num_nodes, num_devices_per_node, 
         # 300M
-        8,  128,  1024,  24,  32,    25600,   _,         _,
+        # 8,  128,  1024,  24,  32,    25600,   _,         _,
         # 1.3B
-        # 1,  128,  2048,  24,  16,    32032, num_nodes, num_devices_per_node, 
+        1,  128,  2048,  24,  16,    32032, num_nodes, num_devices_per_node, 
         #_,_,  PP,  NB, FM,   Remat, RS,    _  _
         _, _,  1,   1,  True, False, False, _, _)
 

@@ -1,23 +1,23 @@
 """Benchmark one case of intra-op only parallelism."""
 from flax import linen as nn
-# from transformers import GPT2Model, GPT2Config
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 from get_wikitext import load_wikitext2, prepare_batch
+from transformers import GPT2Config, FlaxGPT2LMHeadModel
 
 import alpa
 from alpa import parallelize, global_config, set_parallelize_options, LocalPhysicalDeviceMesh
 from alpa.model.bert_model import BertConfig, FlaxBertForMaskedLMModule, TrainState
-from alpa.model.gpt_model import FlaxGPTForLMModule
+# from alpa.model.gpt_model import FlaxGPTForLMModule
 from alpa.util import map_to_shape, count_communication_primitives, print_used_time, GB
 
 import os
 
 as_option = global_config.default_autosharding_option
 
-USE_WIKITEXT2 = True
+USE_WIKITEXT2 = False
 GENERATE_REAL_TRAIN_STATE = True
 
 INPUT_DIR_NAME = "inputs_test/"
@@ -35,8 +35,11 @@ def compute_gpt_parameter_count(num_layers, hidden_size, vocab_size):
 
 
 def create_train_state(rngkey, model, batch, dtype):
-    params = model.init(rngkey, batch["input_ids"], batch["attention_mask"],
-                              batch["token_type_ids"], batch["position_ids"])
+    params = model.init_dummy(rngkey, batch["input_ids"], batch["attention_mask"],
+                              batch["position_ids"])
+
+    # params = jax.jit(model.init)(rngkey, batch["input_ids"], batch["attention_mask"],
+    #                           batch["token_type_ids"], batch["position_ids"])                          
 
     def weight_decay_mask(pytree):
         # do not use weight decay on layer norm and bias.
@@ -158,7 +161,7 @@ def benchmark_2d_one_case_gpt_bert(physical_mesh, model_type, benchmark_case):
 
     # Init train state
     if model_type == "gpt":
-        model = FlaxGPTForLMModule(BertConfig(
+        model = FlaxGPT2LMHeadModel.module_class(GPT2Config(
             num_hidden_layers=num_layers,
             hidden_size=hidden_size,
             intermediate_size=hidden_size * 4,
@@ -167,6 +170,7 @@ def benchmark_2d_one_case_gpt_bert(physical_mesh, model_type, benchmark_case):
             max_position_embeddings=seq_len,
             type_vocab_size=0,
             gradient_checkpointing=use_remat,
+            add_cross_attention=True
         ), dtype=dtype)
     elif model_type == "bert":
         model = FlaxBertForMaskedLMModule(BertConfig(
@@ -181,6 +185,7 @@ def benchmark_2d_one_case_gpt_bert(physical_mesh, model_type, benchmark_case):
         ), dtype=dtype)
     else:
         raise ValueError(f"Invalid model {model_type}")
+
 
     create_func = create_train_state if GENERATE_REAL_TRAIN_STATE else create_train_state_aval
 
@@ -201,7 +206,7 @@ if __name__ == "__main__":
     model_type = "gpt"
 
     num_nodes = 1  # machines
-    num_devices_per_node = 32  # cores
+    num_devices_per_node = 2  # cores
     _ = None
 
     # Define a model with 1.3B parameters
@@ -215,13 +220,13 @@ if __name__ == "__main__":
         #B, S,     H      L,  #head, V,     LD0,       LD1,  
         # hidden size and vocab size should be multiples of num_devices
         # 12M testing
-        # 16,  512,  512,  2,  32,    12800, num_nodes, num_devices_per_node, 
+        16,  512,  512,  2,  32,    12800, num_nodes, num_devices_per_node, 
         # 300M
         # 1,  128,  1024,  24,  32,    25600, num_nodes, num_devices_per_node,
         # test
-        # 1,  128,  1600,  24,  32,    25600, num_nodes, num_devices_per_node,
+        # 1,  128,  2048,  18,  32,    25600, num_nodes, num_devices_per_node,
         # 1.3B
-        1,  128,  2048,  24,  32,    32032, num_nodes, num_devices_per_node, 
+        # 16,  128,  2048,  24,  32,    32032, num_nodes, num_devices_per_node, 
         #_,_,  PP,  NB, FM,   Remat, RS,    _  _
         _, _,  1,   1,  True, False, False, _, _)
 
@@ -240,43 +245,43 @@ if __name__ == "__main__":
     executable, args_flat = benchmark_2d_one_case_gpt_bert(physical_mesh, model_type, benchmark_case)
 
     # Write args
-    print("Write args to inputs/")
-    sharded_args = executable.preshard_dynamic_args(*args_flat)
-    num_inputs = len(sharded_args)
-    print("Number of inputs:", num_inputs)
-    cwd = os.getcwd()
-    main_dir = os.path.join(INPUT_DIR_NAME, "iter_" + str(0))
-    partition_dir_name="partition_id"
-    ins_folder = os.path.join(cwd, main_dir)
-    partition_id_folder = os.path.join(ins_folder, partition_dir_name)
-    if not os.path.exists(ins_folder):
-        os.makedirs(ins_folder)
-    if not os.path.exists(partition_id_folder):
-        os.makedirs(partition_id_folder)
-    for i, arg in enumerate(sharded_args):
-        # print(i, ":", type(arg), arg.shape)
-        for j, device in enumerate(arg.device_buffers):
-            device_folder = os.path.join(ins_folder, "dev_" + str(j))
-            if not os.path.exists(device_folder):
-                os.makedirs(device_folder)
-            arg_path = os.path.join(device_folder, str(i))
-            # print(i, ":", f"dev_{j}", ":", type(arg.device_buffers[j]), arg.device_buffers[j].shape)
-            # print(arg.device_buffers[j])
-            jnp.save(arg_path, arg.device_buffers[j])
-    for i in range(32):
-        partition_id = jnp.array([i], dtype=np.uint32)
-        arg_path = os.path.join(partition_id_folder, "partition_id_" + str(i))
-        jnp.save(arg_path, partition_id)
+    # print("Write args to inputs/")
+    # sharded_args = executable.preshard_dynamic_args(*args_flat)
+    # num_inputs = len(sharded_args)
+    # print("Number of inputs:", num_inputs)
+    # cwd = os.getcwd()
+    # main_dir = os.path.join(INPUT_DIR_NAME, "iter_" + str(0))
+    # partition_dir_name="partition_id"
+    # ins_folder = os.path.join(cwd, main_dir)
+    # partition_id_folder = os.path.join(ins_folder, partition_dir_name)
+    # if not os.path.exists(ins_folder):
+    #     os.makedirs(ins_folder)
+    # if not os.path.exists(partition_id_folder):
+    #     os.makedirs(partition_id_folder)
+    # for i, arg in enumerate(sharded_args):
+    #     # print(i, ":", type(arg), arg.shape)
+    #     for j, device in enumerate(arg.device_buffers):
+    #         device_folder = os.path.join(ins_folder, "dev_" + str(j))
+    #         if not os.path.exists(device_folder):
+    #             os.makedirs(device_folder)
+    #         arg_path = os.path.join(device_folder, str(i))
+    #         # print(i, ":", f"dev_{j}", ":", type(arg.device_buffers[j]), arg.device_buffers[j].shape)
+    #         # print(arg.device_buffers[j])
+    #         jnp.save(arg_path, arg.device_buffers[j])
+    # for i in range(32):
+    #     partition_id = jnp.array([i], dtype=np.uint32)
+    #     arg_path = os.path.join(partition_id_folder, "partition_id_" + str(i))
+    #     jnp.save(arg_path, partition_id)
 
     # # Write hlo ir to a file
     # # print(type(executable))
 
-    print("Write hlo module to files...")
-    with open("executable_hlo.txt", "w") as fout:
-        fout.write(executable.hlo_module.to_string())
+    # print("Write hlo module to files...")
+    # with open("executable_hlo.txt", "w") as fout:
+    #     fout.write(executable.hlo_module.to_string())
 
-    with open("executable_hlo.proto", "wb") as fout:
-        fout.write(executable.hlo_module.as_serialized_hlo_module_proto())
+    # with open("executable_hlo.proto", "wb") as fout:
+    #     fout.write(executable.hlo_module.as_serialized_hlo_module_proto())
 
     # Get the sharding specs of the inputs and outputs of the hlo module
     # print(executable.input_sharding_specs)
